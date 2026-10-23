@@ -647,7 +647,7 @@ mod tests {
 
         let mut record = SearchRecord::new(0);
         absorb(&mut record, &dump);
-        assert_eq!(record.candidates.len(), 30);
+        assert_eq!(record.candidates.len(), 50);
         let stored = serde_json::to_vec(&record).expect("the record serializes");
         assert!(
             stored.len() < 256 * 1024,
@@ -656,7 +656,7 @@ mod tests {
         );
         assert_eq!(
             finish_search(&mut record).expect("search completes").len(),
-            30
+            50
         );
     }
 

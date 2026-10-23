@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Candidate naming: a search result's candidate now carries an empty path and a
+  file name built from the video title, prefixed with the uploader when the
+  title does not name the channel, so the server derives the artist and title
+  it matches against instead of scoring a bare video id and rejecting every
+  candidate.
+
 ## [0.1.1] - 2026-10-23
 
 ### Fixed

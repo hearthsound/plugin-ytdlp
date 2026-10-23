@@ -97,15 +97,24 @@ run at once.
   with `<prefix><count>:<artist> <title>` as the search text, where `<artist>`
   is the track's primary artist. The template projects the fields a candidate
   needs into one compact JSON object per result: `id`, `title`,
-  `webpage_url`, `extractor`, `channel_id`, `uploader_id`, `duration`, and the
-  selected format's `format_id`, `ext`, `vcodec`, `acodec`, `abr`, `asr`,
-  `filesize` and `filesize_approx`. A result line is a few hundred bytes
-  rather than a full metadata dump, so the plugin parses it as it arrives and
-  never stores the raw output.
+  `webpage_url`, `extractor`, `channel`, `channel_id`, `uploader`,
+  `uploader_id`, `duration`, and the selected format's `format_id`, `ext`,
+  `vcodec`, `acodec`, `abr`, `asr`, `filesize` and `filesize_approx`. A result
+  line is a few hundred bytes rather than a full metadata dump, so the plugin
+  parses it as it arrives and never stores the raw output.
 - yt-dlp selects the format: `-f bestaudio/best` asks for an audio-only
   format, `-S abr` sorts by average bitrate, and the fallback keeps a result
   usable when a site offers only muxed formats. The plugin skips a result
   whose selected format is not audio-only or that has no page URL.
+- A candidate's file name is the video title plus the format's extension. When
+  the title does not already name the channel, the uploader is prefixed as
+  `<uploader> - <title>`, and a YouTube `Artist - Topic` channel contributes
+  only the artist, so the server derives an artist and a title from the name.
+  The name has path separators and control characters replaced, whitespace
+  collapsed and its stem capped at 120 characters. The candidate's `path` is
+  empty, which is what makes the server read the name; the page URL and the
+  video id travel only in the token. The download's output path is the file
+  yt-dlp wrote, not this name.
 - The file's `format` comes from the format's audio codec: `opus` stays
   `opus`, an `mp4a` codec becomes `aac`, and `vorbis` and `mp3` keep their
   names. A codec the server does not name leaves the field empty. The bitrate

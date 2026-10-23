@@ -18,6 +18,12 @@ const DEFAULT_EXTRACTOR: &str = "youtube";
 /// Most characters of an unreadable line kept in an error message.
 const EXCERPT_CHARS: usize = 160;
 
+/// Most characters of a candidate name's stem, before the extension.
+const MAX_NAME_CHARS: usize = 120;
+
+/// The suffix YouTube adds to an artist's generated topic channel.
+const TOPIC_SUFFIX: &str = " - topic";
+
 /// One result line yt-dlp printed.
 #[derive(Debug, Deserialize)]
 struct Video {
@@ -35,8 +41,14 @@ struct Video {
     extractor: Option<String>,
     /// The channel the video belongs to.
     #[serde(default)]
+    channel: Option<String>,
+    /// The channel's id.
+    #[serde(default)]
     channel_id: Option<String>,
-    /// The uploader, used when the result has no channel id.
+    /// The uploader's display name, preferred over the channel name.
+    #[serde(default)]
+    uploader: Option<String>,
+    /// The uploader's id.
     #[serde(default)]
     uploader_id: Option<String>,
     /// The duration in seconds.
@@ -103,9 +115,9 @@ pub struct StoredCandidate {
     pub token: String,
     /// The result's title.
     pub title: String,
-    /// The page the result plays on.
+    /// Always empty: the server reads the file name for the artist and title.
     pub path: String,
-    /// The file name the download will produce.
+    /// The name the server derives the candidate's tags from.
     pub name: String,
     /// The selected format's size in bytes, when yt-dlp knows it.
     pub size: Option<u64>,
@@ -192,16 +204,12 @@ fn candidate_from(video: Video) -> Option<StoredCandidate> {
     if !is_audio_only(&video) {
         return None;
     }
+    let name = candidate_name(&video);
     let ext = video.ext.clone();
-    let name = if ext.is_empty() {
-        video.id.clone()
-    } else {
-        format!("{}.{}", video.id, ext)
-    };
     let token = DownloadToken {
-        url: url.clone(),
+        url,
         format_id: video.format_id.clone(),
-        ext: ext.clone(),
+        ext,
         id: video.id.clone(),
     }
     .encode()
@@ -209,7 +217,7 @@ fn candidate_from(video: Video) -> Option<StoredCandidate> {
     Some(StoredCandidate {
         token,
         title: video.title,
-        path: url,
+        path: String::new(),
         name,
         size: video.filesize.or(video.filesize_approx),
         format: video
@@ -226,6 +234,89 @@ fn candidate_from(video: Video) -> Option<StoredCandidate> {
             video.uploader_id.as_deref(),
         ),
     })
+}
+
+/// Builds the candidate name the server derives its tags from.
+///
+/// The server reads an empty path's file name as `Artist - Title.ext`, so the
+/// name carries the video title and, when the title does not already name the
+/// channel, the uploader as the artist. YouTube's `Artist - Topic` channels
+/// are reduced to the artist.
+///
+/// # Parameters
+///
+/// - `video`: one parsed result.
+///
+/// # Returns
+///
+/// `<title>.<ext>`, or `<uploader> - <title>.<ext>` when the title does not
+/// contain the uploader. The stem is trimmed of path separators and control
+/// characters, whitespace is collapsed and the stem is capped at
+/// [`MAX_NAME_CHARS`], with the result's id as the last fallback.
+fn candidate_name(video: &Video) -> String {
+    let title = sanitize(&video.title);
+    let uploader = channel_name(video.uploader.as_deref().or(video.channel.as_deref()));
+    let stem = if uploader.is_empty() || title.to_lowercase().contains(&uploader.to_lowercase()) {
+        title
+    } else {
+        sanitize(&format!("{uploader} - {title}"))
+    };
+    let stem = truncate(&stem, MAX_NAME_CHARS);
+    let stem = if stem.is_empty() {
+        video.id.clone()
+    } else {
+        stem
+    };
+    if video.ext.is_empty() {
+        stem
+    } else {
+        format!("{stem}.{}", video.ext)
+    }
+}
+
+/// Returns an uploader name without a trailing topic-channel suffix.
+fn channel_name(name: Option<&str>) -> String {
+    let name = name.map(str::trim).unwrap_or_default();
+    if let Some(start) = name.len().checked_sub(TOPIC_SUFFIX.len())
+        && let Some(suffix) = name.get(start..)
+        && suffix.eq_ignore_ascii_case(TOPIC_SUFFIX)
+        && let Some(stem) = name.get(..start)
+    {
+        return stem.trim().to_string();
+    }
+    name.to_string()
+}
+
+/// Replaces path separators and control characters and collapses whitespace.
+fn sanitize(text: &str) -> String {
+    let mut cleaned = String::with_capacity(text.len());
+    let mut last_space = false;
+    for character in text.chars() {
+        let character = match character {
+            '/' | '\\' => '-',
+            character if character.is_control() => ' ',
+            character => character,
+        };
+        if character == ' ' {
+            if last_space || cleaned.is_empty() {
+                continue;
+            }
+            last_space = true;
+        } else {
+            last_space = false;
+        }
+        cleaned.push(character);
+    }
+    cleaned.trim().to_string()
+}
+
+/// Cuts text to at most `limit` characters and trims the cut.
+fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(limit).collect();
+    truncated.trim_end().to_string()
 }
 
 /// Returns whether a result's selected format carries audio and no video.
@@ -332,44 +423,128 @@ mod tests {
             .collect()
     }
 
+    /// Builds a parsed result for the name tests.
+    fn video(title: &str, uploader: Option<&str>, ext: &str) -> Video {
+        Video {
+            id: "vid0000001".to_string(),
+            title: title.to_string(),
+            webpage_url: Some("https://example.test/vid0000001".to_string()),
+            extractor: Some("youtube".to_string()),
+            channel: None,
+            channel_id: Some("chan0000001".to_string()),
+            uploader: uploader.map(str::to_string),
+            uploader_id: Some("@channel".to_string()),
+            duration: Some(200.0),
+            format_id: "251".to_string(),
+            ext: ext.to_string(),
+            vcodec: Some("none".to_string()),
+            acodec: Some("opus".to_string()),
+            abr: Some(128.0),
+            asr: Some(48_000.0),
+            filesize: Some(1_000_000),
+            filesize_approx: None,
+        }
+    }
+
     #[test]
     fn parses_every_result() {
         let candidates = parsed(SEARCH);
-        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates.len(), 5);
         assert_eq!(
             candidates[0].title,
-            "Weyes Blood - Andromeda (Official Video)"
+            "Weyes Blood - Something To Believe (Live on KEXP)"
+        );
+        assert_eq!(candidates[1].title, "Something to Believe");
+        assert_eq!(
+            candidates[2].title,
+            "Weyes Blood | \u{201c}Something to Believe\u{201d} | Midwinter 2019"
         );
         assert_eq!(
-            candidates[1].title,
-            "Weyes Blood - Andromeda (HD) [Official Music Video]"
+            candidates[3].title,
+            "Weyes Blood - Something To Believe (Rough Trade Session)"
         );
-        assert_eq!(candidates[2].title, "Weyes Blood - Andromeda");
     }
 
     #[test]
     fn reads_the_selected_audio_format() {
         let candidates = parsed(SEARCH);
         let candidate = &candidates[0];
-        assert_eq!(candidate.name, "ZHGw78IJryE.webm");
+        assert_eq!(
+            candidate.name,
+            "Weyes Blood - Something To Believe (Live on KEXP).webm"
+        );
+        assert!(candidate.path.is_empty());
         assert_eq!(candidate.format.as_deref(), Some("opus"));
-        assert_eq!(candidate.bitrate_kbps, Some(132));
+        assert_eq!(candidate.bitrate_kbps, Some(138));
         assert_eq!(candidate.sample_rate, Some(48_000));
-        assert_eq!(candidate.size, Some(4_628_757));
-        assert_eq!(candidate.duration_ms, Some(280_000));
+        assert_eq!(candidate.size, Some(4_948_253));
+        assert_eq!(candidate.duration_ms, Some(287_000));
 
         let token = DownloadToken::decode(&candidate.token).expect("token decodes");
         assert_eq!(token.format_id, "251");
         assert_eq!(token.ext, "webm");
-        assert_eq!(token.id, "ZHGw78IJryE");
-        assert_eq!(token.url, "https://www.youtube.com/watch?v=ZHGw78IJryE");
+        assert_eq!(token.id, "inSrVJJA9dE");
+        assert_eq!(token.url, "https://www.youtube.com/watch?v=inSrVJJA9dE");
+    }
+
+    #[test]
+    fn prefixes_the_channel_when_the_title_lacks_it() {
+        let candidates = parsed(SEARCH);
+        assert_eq!(
+            candidates[1].name,
+            "Weyes Blood - Something to Believe.webm"
+        );
+        assert_eq!(
+            candidates[2].name,
+            "Pitchfork - Weyes Blood | \u{201c}Something to Believe\u{201d} | Midwinter 2019.webm"
+        );
+    }
+
+    #[test]
+    fn builds_candidate_names() {
+        assert_eq!(
+            candidate_name(&video("Something to Believe", Some("Weyes Blood"), "webm")),
+            "Weyes Blood - Something to Believe.webm"
+        );
+        assert_eq!(
+            candidate_name(&video(
+                "Something to Believe",
+                Some("Weyes Blood - Topic"),
+                "webm"
+            )),
+            "Weyes Blood - Something to Believe.webm"
+        );
+        assert_eq!(
+            candidate_name(&video(
+                "Weyes Blood - Something To Believe (Live on KEXP)",
+                Some("KEXP"),
+                "webm"
+            )),
+            "Weyes Blood - Something To Believe (Live on KEXP).webm"
+        );
+        assert_eq!(
+            candidate_name(&video("AC/DC - Back in Black", None, "mp3")),
+            "AC-DC - Back in Black.mp3"
+        );
+        assert_eq!(
+            candidate_name(&video("Line\nbreak\tSong", None, "opus")),
+            "Line break Song.opus"
+        );
+        assert_eq!(candidate_name(&video("No format", None, "")), "No format");
+        let long = format!("Weyes Blood - {}", "x".repeat(400));
+        let name = candidate_name(&video(&long, None, "webm"));
+        assert!(name.ends_with(".webm"));
+        assert_eq!(
+            name.trim_end_matches(".webm").chars().count(),
+            MAX_NAME_CHARS
+        );
     }
 
     #[test]
     fn names_the_channel() {
         let candidates = parsed(SEARCH);
-        assert_eq!(candidates[0].source_key, "youtube:UCngjw6cGfzm6bUIDuhGMntg");
-        assert_eq!(candidates[2].source_key, "youtube:UCsgEkEWaXKQwrhlLHFbcQFw");
+        assert_eq!(candidates[0].source_key, "youtube:UC3I2GFN_F8WudD_2jUZbojA");
+        assert_eq!(candidates[2].source_key, "youtube:UC7kI8WjpCfFoMSNDuRh_4lA");
     }
 
     #[test]

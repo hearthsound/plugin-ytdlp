@@ -19,7 +19,7 @@ pub const SEARCH_TIMEOUT_MS: u32 = 120_000;
 /// The projection keeps the fields the plugin's candidate needs and nothing
 /// else, so a result line is a few hundred bytes instead of the full metadata
 /// dump. `j` encodes the object as JSON.
-const SEARCH_FIELDS: &str = "%(.{id,title,webpage_url,extractor,channel_id,uploader_id,duration,format_id,ext,vcodec,acodec,abr,asr,filesize,filesize_approx})j";
+const SEARCH_FIELDS: &str = "%(.{id,title,webpage_url,extractor,channel,channel_id,uploader,uploader_id,duration,format_id,ext,vcodec,acodec,abr,asr,filesize,filesize_approx})j";
 
 /// Builds the search text, prefix included.
 ///
