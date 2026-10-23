@@ -3,7 +3,7 @@
 //! The host starts a tool with an argument vector and never a shell, so every
 //! argument is built here as one list element. Keeping the vectors in one place
 //! makes them testable on the host target: the unit tests assert the exact
-//! arguments a search, a download and the version probe pass.
+//! arguments a search and a download pass.
 
 use crate::config::{Config, SearchPrefix};
 use crate::token::DownloadToken;
@@ -13,6 +13,13 @@ use crate::token::DownloadToken;
 /// A search only prints metadata for at most ten results, but the site lookup
 /// can be slow, so the limit is generous.
 pub const SEARCH_TIMEOUT_MS: u32 = 120_000;
+
+/// The object yt-dlp prints for one search result.
+///
+/// The projection keeps the fields the plugin's candidate needs and nothing
+/// else, so a result line is a few hundred bytes instead of the full metadata
+/// dump. `j` encodes the object as JSON.
+const SEARCH_FIELDS: &str = "%(.{id,title,webpage_url,extractor,channel_id,uploader_id,duration,format_id,ext,vcodec,acodec,abr,asr,filesize,filesize_approx})j";
 
 /// Builds the search text, prefix included.
 ///
@@ -60,15 +67,22 @@ fn prefix(search: SearchPrefix) -> &'static str {
 ///
 /// # Returns
 ///
-/// The argument vector that prints one JSON object per result to standard
-/// output without downloading anything.
+/// The argument vector that prints one compact JSON object per result to
+/// standard output without downloading anything. Format selection is left to
+/// yt-dlp: it picks the audio-only format with the highest average bitrate,
+/// falling back to a muxed format the parser then skips.
 pub fn search_arguments(target: &str) -> Vec<String> {
     [
         "--ignore-config",
         "--no-warnings",
         "--no-playlist",
         "--skip-download",
-        "--dump-json",
+        "-f",
+        "bestaudio/best",
+        "-S",
+        "abr",
+        "--print",
+        SEARCH_FIELDS,
         target,
     ]
     .into_iter()
@@ -88,7 +102,9 @@ pub fn search_arguments(target: &str) -> Vec<String> {
 ///
 /// The argument vector that downloads the chosen format, extracts its audio
 /// without re-encoding, embeds metadata, reports progress and prints the final
-/// file path.
+/// file path. The template repeats the `download:` prefix because yt-dlp uses
+/// the first one as the progress type, and `--no-quiet` restores progress,
+/// which `--print` would otherwise suppress.
 pub fn download_arguments(key: &str, token: &DownloadToken) -> Vec<String> {
     [
         "--ignore-config".to_string(),
@@ -100,8 +116,9 @@ pub fn download_arguments(key: &str, token: &DownloadToken) -> Vec<String> {
         "best".to_string(),
         "--embed-metadata".to_string(),
         "--newline".to_string(),
+        "--no-quiet".to_string(),
         "--progress-template".to_string(),
-        "download:%(progress.downloaded_bytes)s/%(progress.total_bytes)s".to_string(),
+        "download:download:%(progress.downloaded_bytes)s/%(progress.total_bytes)s".to_string(),
         "-o".to_string(),
         format!("{key}/%(id)s.%(ext)s"),
         "--print".to_string(),
@@ -127,10 +144,23 @@ mod tests {
                 "--no-warnings",
                 "--no-playlist",
                 "--skip-download",
-                "--dump-json",
+                "-f",
+                "bestaudio/best",
+                "-S",
+                "abr",
+                "--print",
+                SEARCH_FIELDS,
                 "ytsearch5:Radiohead Creep",
             ]
         );
+    }
+
+    #[test]
+    fn keeps_the_search_output_small() {
+        let fields = SEARCH_FIELDS;
+        assert!(fields.contains("format_id"));
+        assert!(fields.contains("filesize_approx"));
+        assert!(fields.ends_with(")j"));
     }
 
     #[test]
@@ -176,8 +206,9 @@ mod tests {
                 "best",
                 "--embed-metadata",
                 "--newline",
+                "--no-quiet",
                 "--progress-template",
-                "download:%(progress.downloaded_bytes)s/%(progress.total_bytes)s",
+                "download:download:%(progress.downloaded_bytes)s/%(progress.total_bytes)s",
                 "-o",
                 "3f1c2a/%(id)s.%(ext)s",
                 "--print",

@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where the host denies the spawn and the setup summary showed the instance as
   an invalid configuration. It validates the configuration and says that
   yt-dlp is checked when an acquisition runs.
+- Tool failures: every `host-process` error now reaches the server with its
+  detail, a denied spawn or a failed start as `unavailable` and an empty
+  `tools.yt-dlp.path` as `invalid-config`, and a search output line that is
+  not a result object fails the search with that line's text instead of an
+  internal error.
+- Search and download state: a search kept its whole metadata dump between
+  polls, which exceeded the host's value cap on real output; it now asks yt-dlp
+  to project only the fields a candidate needs, parses each complete line as
+  it arrives and stores the reduced candidates with the unfinished line. The
+  download's progress template and `--no-quiet` make progress and the printed
+  output path parse from current yt-dlp output.
 
 ## [0.1.0] - 2026-10-23
 

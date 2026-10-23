@@ -1,0 +1,10 @@
+[youtube] ZHGw78IJryE: Downloading webpage
+[info] ZHGw78IJryE: Downloading 1 format(s): 251
+[download] Destination: /tmp/dl-test/ZHGw78IJryE.webm
+download:1024/4628757
+download:1047552/4628757
+download:4628757/4628757
+[ExtractAudio] Destination: /tmp/dl-test/ZHGw78IJryE.opus
+Deleting original file /tmp/dl-test/ZHGw78IJryE.webm (pass -k to keep)
+[Metadata] Adding metadata to "/tmp/dl-test/ZHGw78IJryE.opus"
+/tmp/dl-test/ZHGw78IJryE.opus

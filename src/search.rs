@@ -1,21 +1,24 @@
-//! Turning `yt-dlp --dump-json` output into candidates.
+//! Turning a yt-dlp search's output into candidates.
 //!
-//! A search asks yt-dlp for metadata only, so standard output is one JSON
-//! object per result. Each object lists every format the site offers; the
-//! plugin keeps the best audio-only one, which is what a download then asks
-//! yt-dlp to fetch and extract.
+//! A search asks yt-dlp to select each result's best audio-only format and to
+//! print one compact JSON object per result. The objects are a few hundred
+//! bytes, so the plugin parses them as they arrive and keeps only the reduced
+//! candidates between polls, never the raw output.
 
 use hearthsound_plugin::process_acquisition_provider::exports::hearthsound::plugin::acquisition::{
     Candidate, CandidateFile, SourceInfo,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::token::DownloadToken;
 
 /// The default extractor name when a result does not name one.
 const DEFAULT_EXTRACTOR: &str = "youtube";
 
-/// One result of `yt-dlp --dump-json`.
+/// Most characters of an unreadable line kept in an error message.
+const EXCERPT_CHARS: usize = 160;
+
+/// One result line yt-dlp printed.
 #[derive(Debug, Deserialize)]
 struct Video {
     /// The site's id for the video.
@@ -39,18 +42,10 @@ struct Video {
     /// The duration in seconds.
     #[serde(default)]
     duration: Option<f64>,
-    /// Every format the site offers.
-    #[serde(default)]
-    formats: Vec<Format>,
-}
-
-/// One format of a result.
-#[derive(Debug, Deserialize)]
-struct Format {
-    /// The id a download passes back to yt-dlp.
+    /// The id of the format yt-dlp selected.
     #[serde(default)]
     format_id: String,
-    /// The container extension.
+    /// The container extension of the selected format.
     #[serde(default)]
     ext: String,
     /// The video codec; `none` marks an audio-only format.
@@ -66,44 +61,138 @@ struct Format {
     #[serde(default)]
     asr: Option<f64>,
     /// The exact file size in bytes.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_u64")]
     filesize: Option<u64>,
     /// The estimated file size in bytes.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_u64")]
     filesize_approx: Option<u64>,
 }
 
-/// Parses the standard output of a search into candidates.
+/// Deserializes a byte count yt-dlp may report as an integer, a float or null.
 ///
 /// # Parameters
 ///
-/// - `stdout`: the complete output of `yt-dlp --dump-json`, one JSON object per
-///   line. Blank lines and lines that are not a result object are skipped, so
-///   a stray line does not discard the rest of a search.
+/// - `deserializer`: the field's value.
 ///
 /// # Returns
 ///
-/// One candidate per result that carries an audio-only format and a page URL,
-/// in the order the results were printed.
-pub fn candidates(stdout: &str) -> Vec<Candidate> {
-    stdout
-        .lines()
-        .filter_map(|line| parse_video(line.trim()))
-        .collect()
+/// The count rounded to a whole number of bytes, or `None` for null and for a
+/// value that is not a non-negative finite number.
+fn optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(deserializer)?;
+    Ok(value.and_then(|bytes| {
+        if bytes.is_finite() && bytes >= 0.0 && bytes <= u64::MAX as f64 {
+            Some(bytes.round() as u64)
+        } else {
+            None
+        }
+    }))
 }
 
-/// Parses one output line into a candidate.
-fn parse_video(line: &str) -> Option<Candidate> {
-    if line.is_empty() {
-        return None;
+/// A candidate reduced to the values the server needs.
+///
+/// The plugin stores one of these between polls, so it carries no format list
+/// and serializes to a few hundred bytes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredCandidate {
+    /// The opaque token a download passes back.
+    pub token: String,
+    /// The result's title.
+    pub title: String,
+    /// The page the result plays on.
+    pub path: String,
+    /// The file name the download will produce.
+    pub name: String,
+    /// The selected format's size in bytes, when yt-dlp knows it.
+    pub size: Option<u64>,
+    /// The selected format's audio codec as a server format name.
+    pub format: Option<String>,
+    /// The selected format's average bitrate in kbps.
+    pub bitrate_kbps: Option<u32>,
+    /// The selected format's sample rate in Hz.
+    pub sample_rate: Option<u32>,
+    /// The result's duration in milliseconds.
+    pub duration_ms: Option<u32>,
+    /// The source key shared by results from one channel.
+    pub source_key: String,
+}
+
+impl StoredCandidate {
+    /// Renders the interface's candidate record.
+    ///
+    /// # Returns
+    ///
+    /// One candidate with one file and no peer-queue details.
+    pub fn to_wit(&self) -> Candidate {
+        Candidate {
+            token: self.token.clone(),
+            title: self.title.clone(),
+            path: self.path.clone(),
+            files: vec![CandidateFile {
+                name: self.name.clone(),
+                size: self.size,
+                format: self.format.clone(),
+                bitrate_kbps: self.bitrate_kbps,
+                sample_rate: self.sample_rate,
+                bit_depth: None,
+                duration_ms: self.duration_ms,
+                track_index: None,
+            }],
+            source: SourceInfo {
+                key: self.source_key.clone(),
+                speed_bps: None,
+                queue_length: None,
+                free_slot: None,
+            },
+        }
     }
-    let video: Video = serde_json::from_str(line).ok()?;
-    if video.id.is_empty() || video.title.is_empty() {
+}
+
+/// Parses one complete output line.
+///
+/// # Parameters
+///
+/// - `line`: one line of `yt-dlp --print` output.
+///
+/// # Returns
+///
+/// `Ok(Some(candidate))` for a result the server can use, `Ok(None)` for a
+/// blank line and for a result without a page or without an audio-only
+/// selected format.
+///
+/// # Errors
+///
+/// Returns a message naming the line when it is not a JSON result object, so
+/// the server log says what yt-dlp printed instead of the search silently
+/// returning nothing.
+pub fn parse_line(line: &str) -> Result<Option<StoredCandidate>, String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+    let video: Video = serde_json::from_str(line).map_err(|error| {
+        format!(
+            "a search output line is not a result object ({error}): {}",
+            excerpt(line)
+        )
+    })?;
+    Ok(candidate_from(video))
+}
+
+/// Builds a candidate from one parsed result.
+fn candidate_from(video: Video) -> Option<StoredCandidate> {
+    if video.id.is_empty() || video.title.is_empty() || video.format_id.is_empty() {
         return None;
     }
     let url = video.webpage_url.clone()?;
-    let format = best_audio_format(&video.formats)?;
-    let ext = format.ext.clone();
+    if !is_audio_only(&video) {
+        return None;
+    }
+    let ext = video.ext.clone();
     let name = if ext.is_empty() {
         video.id.clone()
     } else {
@@ -111,76 +200,50 @@ fn parse_video(line: &str) -> Option<Candidate> {
     };
     let token = DownloadToken {
         url: url.clone(),
-        format_id: format.format_id.clone(),
+        format_id: video.format_id.clone(),
         ext: ext.clone(),
         id: video.id.clone(),
     }
     .encode()
     .ok()?;
-    let file = CandidateFile {
+    Some(StoredCandidate {
+        token,
+        title: video.title,
+        path: url,
         name,
-        size: format.filesize.or(format.filesize_approx),
-        format: format
+        size: video.filesize.or(video.filesize_approx),
+        format: video
             .acodec
             .as_deref()
             .and_then(codec_name)
             .map(str::to_string),
-        bitrate_kbps: format.abr.and_then(round_u32),
-        sample_rate: format.asr.and_then(round_u32),
-        bit_depth: None,
+        bitrate_kbps: video.abr.and_then(round_u32),
+        sample_rate: video.asr.and_then(round_u32),
         duration_ms: video.duration.and_then(round_ms),
-        track_index: None,
-    };
-    Some(Candidate {
-        token,
-        title: video.title,
-        path: url,
-        files: vec![file],
-        source: SourceInfo {
-            key: source_key(
-                video.extractor.as_deref(),
-                video.channel_id.as_deref(),
-                video.uploader_id.as_deref(),
-            ),
-            speed_bps: None,
-            queue_length: None,
-            free_slot: None,
-        },
+        source_key: source_key(
+            video.extractor.as_deref(),
+            video.channel_id.as_deref(),
+            video.uploader_id.as_deref(),
+        ),
     })
 }
 
-/// Chooses the best audio-only format of a result.
-///
-/// # Parameters
-///
-/// - `formats`: every format the site offers.
-///
-/// # Returns
-///
-/// The audio-only format with the highest average bitrate, or `None` when the
-/// site offers none. A format without a bitrate ranks below every format that
-/// has one.
-fn best_audio_format(formats: &[Format]) -> Option<&Format> {
-    formats
-        .iter()
-        .filter(|format| is_audio_only(format))
-        .max_by(|left, right| {
-            let left = left.abr.unwrap_or(f64::NEG_INFINITY);
-            let right = right.abr.unwrap_or(f64::NEG_INFINITY);
-            left.total_cmp(&right)
-        })
-}
-
-/// Returns whether a format carries audio and no video.
-fn is_audio_only(format: &Format) -> bool {
-    if format.format_id.is_empty() {
-        return false;
-    }
-    format.vcodec.as_deref() == Some("none")
-        && format
+/// Returns whether a result's selected format carries audio and no video.
+fn is_audio_only(video: &Video) -> bool {
+    video.vcodec.as_deref() == Some("none")
+        && video
             .acodec
             .as_deref()
             .is_some_and(|codec| !codec.is_empty() && codec != "none")
+}
+
+/// Returns the start of a line for an error message.
+fn excerpt(line: &str) -> String {
+    let mut excerpt: String = line.chars().take(EXCERPT_CHARS).collect();
+    if line.chars().count() > EXCERPT_CHARS {
+        excerpt.push_str("...");
+    }
+    excerpt
 }
 
 /// Maps a yt-dlp audio codec name to the format name the server stores.
@@ -262,62 +325,96 @@ mod tests {
     /// The captured search output the parsing tests run on.
     const SEARCH: &str = include_str!("fixtures/search.json");
 
+    /// Parses every line of a captured output.
+    fn parsed(text: &str) -> Vec<StoredCandidate> {
+        text.lines()
+            .filter_map(|line| parse_line(line).expect("every line parses"))
+            .collect()
+    }
+
     #[test]
     fn parses_every_result() {
-        let candidates = candidates(SEARCH);
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[0].title, "Example Track One");
-        assert_eq!(candidates[1].title, "Example Track Two");
+        let candidates = parsed(SEARCH);
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(
+            candidates[0].title,
+            "Weyes Blood - Andromeda (Official Video)"
+        );
+        assert_eq!(
+            candidates[1].title,
+            "Weyes Blood - Andromeda (HD) [Official Music Video]"
+        );
+        assert_eq!(candidates[2].title, "Weyes Blood - Andromeda");
     }
 
     #[test]
-    fn picks_the_best_audio_only_format() {
-        let candidates = candidates(SEARCH);
-        let file = &candidates[0].files[0];
-        assert_eq!(file.name, "vid0000001.webm");
-        assert_eq!(file.format.as_deref(), Some("opus"));
-        assert_eq!(file.bitrate_kbps, Some(160));
-        assert_eq!(file.sample_rate, Some(48_000));
-        assert_eq!(file.size, Some(4_000_000));
-        assert_eq!(file.duration_ms, Some(213_000));
+    fn reads_the_selected_audio_format() {
+        let candidates = parsed(SEARCH);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.name, "ZHGw78IJryE.webm");
+        assert_eq!(candidate.format.as_deref(), Some("opus"));
+        assert_eq!(candidate.bitrate_kbps, Some(132));
+        assert_eq!(candidate.sample_rate, Some(48_000));
+        assert_eq!(candidate.size, Some(4_628_757));
+        assert_eq!(candidate.duration_ms, Some(280_000));
 
-        let token = DownloadToken::decode(&candidates[0].token).expect("token decodes");
+        let token = DownloadToken::decode(&candidate.token).expect("token decodes");
         assert_eq!(token.format_id, "251");
         assert_eq!(token.ext, "webm");
-        assert_eq!(token.id, "vid0000001");
-        assert_eq!(token.url, "https://www.youtube.com/watch?v=vid0000001");
+        assert_eq!(token.id, "ZHGw78IJryE");
+        assert_eq!(token.url, "https://www.youtube.com/watch?v=ZHGw78IJryE");
     }
 
     #[test]
-    fn maps_the_codec_of_each_result() {
-        let candidates = candidates(SEARCH);
-        assert_eq!(candidates[0].files[0].format.as_deref(), Some("opus"));
-        assert_eq!(candidates[1].files[0].format.as_deref(), Some("mp3"));
+    fn names_the_channel() {
+        let candidates = parsed(SEARCH);
+        assert_eq!(candidates[0].source_key, "youtube:UCngjw6cGfzm6bUIDuhGMntg");
+        assert_eq!(candidates[2].source_key, "youtube:UCsgEkEWaXKQwrhlLHFbcQFw");
     }
 
     #[test]
-    fn names_the_channel_or_the_uploader() {
-        let candidates = candidates(SEARCH);
-        assert_eq!(candidates[0].source.key, "youtube:chan0000001");
-        assert_eq!(candidates[1].source.key, "soundcloud:uploader01");
+    fn accepts_integer_float_and_null_numbers() {
+        let line = r#"{"id":"v1","title":"Numbers","webpage_url":"https://example.test/v1","duration":280.5,"format_id":"251","ext":"webm","vcodec":"none","acodec":"opus","abr":132.145,"asr":48000,"filesize":null,"filesize_approx":1710107.6}"#;
+        let candidate = parse_line(line)
+            .expect("line parses")
+            .expect("candidate exists");
+        assert_eq!(candidate.size, Some(1_710_108));
+        assert_eq!(candidate.duration_ms, Some(280_500));
+        assert_eq!(candidate.bitrate_kbps, Some(132));
+        assert_eq!(candidate.sample_rate, Some(48_000));
     }
 
     #[test]
-    fn skips_lines_without_audio() {
-        let line = r#"{"id":"v1","title":"Silent","webpage_url":"https://example.test/v1","formats":[{"format_id":"18","ext":"mp4","vcodec":"avc1","acodec":"mp4a.40.2","abr":96}]}"#;
-        assert!(candidates(line).is_empty());
+    fn reports_a_line_that_is_not_a_result() {
+        let error = parse_line("Py\nnot a result").expect_err("line is not a result");
+        assert!(error.contains("not a result"), "unexpected detail: {error}");
+
+        let error = parse_line(r#"{"id":1,"title":"Wrong type"}"#).expect_err("types do not match");
+        assert!(!error.is_empty());
     }
 
     #[test]
-    fn skips_lines_that_are_not_results() {
-        let output = format!("not json\n\n{SEARCH}\n[download] oops\n");
-        assert_eq!(candidates(&output).len(), 2);
+    fn skips_results_without_audio() {
+        let line = r#"{"id":"v1","title":"Muxed","webpage_url":"https://example.test/v1","format_id":"18","ext":"mp4","vcodec":"avc1","acodec":"mp4a.40.2","abr":96}"#;
+        assert!(parse_line(line).expect("line parses").is_none());
     }
 
     #[test]
     fn skips_results_without_a_page() {
-        let line = r#"{"id":"v1","title":"No page","formats":[{"format_id":"251","ext":"webm","vcodec":"none","acodec":"opus","abr":160}]}"#;
-        assert!(candidates(line).is_empty());
+        let line = r#"{"id":"v1","title":"No page","format_id":"251","ext":"webm","vcodec":"none","acodec":"opus","abr":160}"#;
+        assert!(parse_line(line).expect("line parses").is_none());
+    }
+
+    #[test]
+    fn skips_results_without_a_format() {
+        let line = r#"{"id":"v1","title":"No format","webpage_url":"https://example.test/v1","vcodec":"none","acodec":"opus"}"#;
+        assert!(parse_line(line).expect("line parses").is_none());
+    }
+
+    #[test]
+    fn ignores_blank_lines() {
+        assert!(parse_line("").expect("blank line").is_none());
+        assert!(parse_line("  \t ").expect("blank line").is_none());
     }
 
     #[test]
@@ -339,16 +436,5 @@ mod tests {
             source_key(Some("youtube"), Some(""), Some("@handle")),
             "youtube:@handle"
         );
-    }
-
-    #[test]
-    fn prefers_a_format_with_a_bitrate() {
-        let formats: Vec<Format> = serde_json::from_str(
-            r#"[{"format_id":"1","vcodec":"none","acodec":"opus"},{"format_id":"2","vcodec":"none","acodec":"opus","abr":64.4}]"#,
-        )
-        .expect("formats parse");
-        let best = best_audio_format(&formats).expect("one format");
-        assert_eq!(best.format_id, "2");
-        assert_eq!(best.abr.and_then(round_u32), Some(64));
     }
 }

@@ -5,12 +5,13 @@
 //! administrator installs yt-dlp and points `tools.yt-dlp.path` at it, and the
 //! plugin never sees a filesystem path for the tool, only its name.
 //!
-//! A search asks yt-dlp for metadata only, with `--dump-json`, and turns each
-//! result into a candidate carrying the best audio-only format. A download
-//! fetches that format, extracts the audio without re-encoding, embeds the
-//! site's metadata and reports progress from yt-dlp's own progress lines. The
-//! produced file is reported under the staging root, where the server imports
-//! it like any other downloading provider's output.
+//! A search asks yt-dlp to select each result's best audio-only format and to
+//! print one compact JSON object per result, which the plugin parses into a
+//! candidate as the output arrives. A download fetches the chosen format,
+//! extracts the audio without re-encoding, embeds the site's metadata and
+//! reports progress from yt-dlp's own progress lines. The produced file is
+//! reported under the staging root, where the server imports it like any other
+//! downloading provider's output.
 //!
 //! All network access happens inside yt-dlp; the component requests no HTTP
 //! permission.
@@ -33,7 +34,8 @@ use hearthsound_plugin::host::process::{
 };
 use hearthsound_plugin::kv;
 use hearthsound_plugin::process_acquisition_provider::exports::hearthsound::plugin::acquisition::{
-    self, Capabilities, DownloadState, Granularity, OutputFile, Progress, Query, SearchState,
+    self, Candidate, Capabilities, DownloadState, Granularity, OutputFile, Progress, Query,
+    SearchState,
 };
 use hearthsound_plugin::process_acquisition_provider::exports::hearthsound::plugin::lifecycle;
 use hearthsound_plugin::types::ProviderError;
@@ -52,6 +54,17 @@ const SEARCH_TTL_MS: u64 = 10 * 60 * 1000;
 /// How long a stored download may stay readable before it is dropped.
 const DOWNLOAD_TTL_MS: u64 = 2 * 60 * 60 * 1000;
 
+/// Most bytes of an unfinished output line kept between polls.
+///
+/// A stored record has to fit the host's 256 KiB per-value cap, so a line that
+/// grows past this is dropped instead of kept. Search lines are a few hundred
+/// bytes and download lines shorter still; the limit only stops a tool that
+/// never writes a newline from filling the store.
+const MAX_PENDING_BYTES: usize = 64 * 1024;
+
+/// Most characters of one output line kept for a failure message.
+const MAX_TAIL_CHARS: usize = 512;
+
 /// The plugin implementation.
 struct YtDlpAcquisition;
 
@@ -61,8 +74,16 @@ struct YtDlpAcquisition;
 struct SearchRecord {
     /// The process running the search.
     handle: ProcessHandle,
-    /// Everything the process wrote, encoded by [`token::encode_bytes`].
-    output: String,
+    /// The candidates parsed from the complete lines read so far.
+    candidates: Vec<search::StoredCandidate>,
+    /// The bytes of the last, incomplete output line.
+    pending: Vec<u8>,
+    /// Whether the rest of a dropped line is still to be skipped.
+    discard_line: bool,
+    /// The last complete output line, kept for a failure without stderr.
+    stdout_tail: String,
+    /// The first line that was not a result object, for the server log.
+    unparsable: Option<String>,
 }
 
 /// The bytes reported by the last progress line.
@@ -96,6 +117,8 @@ struct DownloadRecord {
     key: String,
     /// The bytes of the last, incomplete output line.
     pending: Vec<u8>,
+    /// Whether the rest of a dropped line is still to be skipped.
+    discard_line: bool,
     /// The last progress yt-dlp reported.
     progress: StoredProgress,
     /// The last file path yt-dlp printed.
@@ -117,6 +140,7 @@ impl DownloadRecord {
             handle,
             key,
             pending: Vec::new(),
+            discard_line: false,
             progress: StoredProgress::default(),
             printed: None,
             stdout_tail: String::new(),
@@ -181,16 +205,18 @@ fn capture_options(timeout_ms: u32) -> SpawnOptions {
 
 /// Maps a host process error to a provider error.
 ///
-/// A tool the manifest does not declare, or one the administrator has not
-/// configured, is a configuration problem; a process the operating system
-/// refused to start is a transient unavailability; an unknown handle means the
-/// record a token names no longer has a process behind it.
+/// Every variant carries its detail into the provider error, so the server log
+/// names the cause. A tool the administrator has not configured is a
+/// configuration problem; a spawn the host denied, a start the operating system
+/// refused and a handle whose process is gone are transient unavailability.
 fn process_error(error: ProcessError) -> ProviderError {
     match error {
-        ProcessError::Denied(message) => ProviderError::InvalidConfig(message),
+        ProcessError::Denied(message) => ProviderError::Unavailable(message),
         ProcessError::NotConfigured(message) => ProviderError::InvalidConfig(message),
         ProcessError::SpawnFailed(message) => ProviderError::Unavailable(message),
-        ProcessError::UnknownHandle => ProviderError::NotFound,
+        ProcessError::UnknownHandle => {
+            ProviderError::Unavailable("the yt-dlp process is no longer running".to_string())
+        }
     }
 }
 
@@ -209,17 +235,87 @@ fn read_stderr(handle: ProcessHandle) -> Vec<u8> {
     process::read_stderr(handle).unwrap_or_default()
 }
 
+impl SearchRecord {
+    /// Builds the record of a just-started search.
+    fn new(handle: ProcessHandle) -> SearchRecord {
+        SearchRecord {
+            handle,
+            candidates: Vec::new(),
+            pending: Vec::new(),
+            discard_line: false,
+            stdout_tail: String::new(),
+            unparsable: None,
+        }
+    }
+
+    /// Keeps the detail of the first output line that was not a result.
+    fn remember_unparsable(&mut self, detail: String) {
+        if self.unparsable.is_none() {
+            self.unparsable = Some(detail);
+        }
+    }
+
+    /// Renders the candidates parsed so far.
+    fn to_wit(&self) -> Vec<Candidate> {
+        self.candidates
+            .iter()
+            .map(search::StoredCandidate::to_wit)
+            .collect()
+    }
+}
+
 /// Appends a search output chunk to its record.
+///
+/// Only complete lines are parsed, so a line split across reads is never
+/// mistaken for bad output. Parsed candidates replace the raw line in the
+/// record, which keeps a stored search far below the host's value cap.
+fn absorb_search(record: &mut SearchRecord, chunk: &[u8]) {
+    for line in progress::append_lines(&mut record.pending, chunk) {
+        if std::mem::take(&mut record.discard_line) {
+            continue;
+        }
+        if !line.trim().is_empty() {
+            record.stdout_tail = clip(line.trim());
+        }
+        match search::parse_line(&line) {
+            Ok(Some(candidate)) => record.candidates.push(candidate),
+            Ok(None) => {}
+            Err(detail) => record.remember_unparsable(detail),
+        }
+    }
+    if record.pending.len() > MAX_PENDING_BYTES {
+        record.pending.clear();
+        record.discard_line = true;
+        record.remember_unparsable(format!(
+            "a search output line exceeded {} KiB",
+            MAX_PENDING_BYTES / 1024
+        ));
+    }
+}
+
+/// Parses the last, unterminated line and returns the search's result.
 ///
 /// # Returns
 ///
-/// Everything the search wrote so far, decoded with replacement characters for
-/// bytes that are not UTF-8.
-fn absorb_search(record: &mut SearchRecord, chunk: &[u8]) -> String {
-    let mut output = token::decode_bytes(&record.output);
-    output.extend_from_slice(chunk);
-    record.output = token::encode_bytes(&output);
-    String::from_utf8_lossy(&output).to_string()
+/// The candidates of every result line.
+///
+/// # Errors
+///
+/// Returns the detail of the first output line that was not a result object,
+/// so a search that printed something else fails with that text.
+fn finish_search(record: &mut SearchRecord) -> Result<Vec<Candidate>, String> {
+    if !record.discard_line && !record.pending.is_empty() {
+        let pending = std::mem::take(&mut record.pending);
+        match search::parse_line(&String::from_utf8_lossy(&pending)) {
+            Ok(Some(candidate)) => record.candidates.push(candidate),
+            Ok(None) => {}
+            Err(detail) => record.remember_unparsable(detail),
+        }
+    }
+    match record.unparsable.take() {
+        Some(detail) => Err(detail),
+        None => Ok(record.to_wit()),
+    }
 }
 
 /// Appends a download output chunk to its record.
@@ -227,7 +323,13 @@ fn absorb_search(record: &mut SearchRecord, chunk: &[u8]) -> String {
 /// Only complete lines are parsed; the bytes of an unfinished line stay in the
 /// record for the next read.
 fn absorb_download(record: &mut DownloadRecord, chunk: &[u8]) {
-    let lines = progress::append_lines(&mut record.pending, chunk);
+    let mut lines = Vec::new();
+    for line in progress::append_lines(&mut record.pending, chunk) {
+        if std::mem::take(&mut record.discard_line) {
+            continue;
+        }
+        lines.push(line);
+    }
     for line in &lines {
         if let Some(reported) = progress::parse_progress(line) {
             record.progress = StoredProgress {
@@ -245,8 +347,17 @@ fn absorb_download(record: &mut DownloadRecord, chunk: &[u8]) {
         .map(|line| line.trim())
         .find(|line| !line.is_empty())
     {
-        record.stdout_tail = line.to_string();
+        record.stdout_tail = clip(line);
     }
+    if record.pending.len() > MAX_PENDING_BYTES {
+        record.pending.clear();
+        record.discard_line = true;
+    }
+}
+
+/// Keeps the start of a line for a failure message.
+fn clip(line: &str) -> String {
+    line.chars().take(MAX_TAIL_CHARS).collect()
 }
 
 impl acquisition::Guest for YtDlpAcquisition {
@@ -271,10 +382,7 @@ impl acquisition::Guest for YtDlpAcquisition {
         let target = args::search_target(&config, artist, &wanted.title);
         let handle = spawn(args::search_arguments(&target), args::SEARCH_TIMEOUT_MS)?;
         let token = Uuid::new_v4().to_string();
-        let record = SearchRecord {
-            handle,
-            output: String::new(),
-        };
+        let record = SearchRecord::new(handle);
         kv::set_json(&search_key(&token), &record, Some(SEARCH_TTL_MS))?;
         hearthsound_plugin::debug!("started a search for `{target}` as {token}");
         Ok(token)
@@ -285,28 +393,32 @@ impl acquisition::Guest for YtDlpAcquisition {
         let mut record: SearchRecord = kv::get_json(&key)?.ok_or(ProviderError::NotFound)?;
         let status = process::poll(record.handle).map_err(process_error)?;
         let handle = record.handle;
-        let mut text = absorb_search(&mut record, &read_stdout(handle)?);
+        absorb_search(&mut record, &read_stdout(handle)?);
         if !matches!(status, ProcessState::Running) {
             // A finished process may have written its last line between the
             // read above and the poll, so take one more read before parsing.
-            text = absorb_search(&mut record, &read_stdout(handle)?);
+            absorb_search(&mut record, &read_stdout(handle)?);
         }
         match status {
             ProcessState::Running => {
                 kv::set_json(&key, &record, Some(SEARCH_TTL_MS))?;
-                Ok(SearchState::Running(search::candidates(&text)))
+                Ok(SearchState::Running(record.to_wit()))
             }
             ProcessState::Exited(0) => {
                 process::kill(record.handle);
                 host_kv::delete(&key);
-                Ok(SearchState::Complete(search::candidates(&text)))
+                finish_search(&mut record)
+                    .map(SearchState::Complete)
+                    .map_err(ProviderError::Unavailable)
             }
             ProcessState::Exited(code) => {
                 let stderr = String::from_utf8_lossy(&read_stderr(record.handle)).to_string();
                 process::kill(record.handle);
                 host_kv::delete(&key);
                 Err(ProviderError::Unavailable(progress::failure_detail(
-                    code, &stderr, &text,
+                    code,
+                    &stderr,
+                    &record.stdout_tail,
                 )))
             }
             ProcessState::Killed => {
@@ -459,3 +571,144 @@ impl lifecycle::Guest for YtDlpAcquisition {
 }
 
 hearthsound_plugin::export_process_acquisition_provider!(YtDlpAcquisition);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A captured search output the size and partial-line tests run on.
+    const SEARCH: &str = include_str!("fixtures/search.json");
+
+    /// A captured download report.
+    const DOWNLOAD: &str = include_str!("fixtures/download.txt");
+
+    /// Feeds a whole output through a record in small chunks, as a process
+    /// read would.
+    fn absorb(search: &mut SearchRecord, output: &str) {
+        for chunk in output.as_bytes().chunks(8192) {
+            absorb_search(search, chunk);
+        }
+    }
+
+    #[test]
+    fn keeps_process_error_details() {
+        match process_error(ProcessError::Denied("too many processes".to_string())) {
+            ProviderError::Unavailable(detail) => assert_eq!(detail, "too many processes"),
+            other => panic!("expected unavailable, got {other:?}"),
+        }
+        match process_error(ProcessError::NotConfigured(
+            "tools.yt-dlp.path is empty".to_string(),
+        )) {
+            ProviderError::InvalidConfig(detail) => {
+                assert!(detail.contains("tools.yt-dlp.path"));
+            }
+            other => panic!("expected invalid config, got {other:?}"),
+        }
+        assert!(matches!(
+            process_error(ProcessError::SpawnFailed("permission denied".to_string())),
+            ProviderError::Unavailable(detail) if detail.contains("permission denied")
+        ));
+        assert!(matches!(
+            process_error(ProcessError::UnknownHandle),
+            ProviderError::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn keeps_an_unfinished_line_between_reads() {
+        let line = SEARCH.lines().next().expect("a fixture line");
+        let split = line.len() / 2;
+        let mut record = SearchRecord::new(0);
+        absorb_search(&mut record, &line.as_bytes()[..split]);
+        assert!(record.candidates.is_empty());
+        assert!(!record.pending.is_empty());
+        absorb_search(&mut record, &line.as_bytes()[split..]);
+        absorb_search(&mut record, b"\n");
+        assert_eq!(record.candidates.len(), 1);
+        assert!(record.pending.is_empty());
+        assert_eq!(
+            finish_search(&mut record).expect("search completes").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_large_dump_stays_reduced() {
+        let padding = "x".repeat(60 * 1024);
+        let mut dump = String::new();
+        for result in 0..10 {
+            for line in SEARCH.lines() {
+                let body = line.trim_end().trim_end_matches('}');
+                dump.push_str(&body.replacen("\"id\": \"", &format!("\"id\": \"{result}-"), 1));
+                dump.push_str(&format!(", \"padding\": \"{padding}\"}}\n"));
+            }
+        }
+        assert!(dump.len() > 1024 * 1024, "dump is {} bytes", dump.len());
+
+        let mut record = SearchRecord::new(0);
+        absorb(&mut record, &dump);
+        assert_eq!(record.candidates.len(), 30);
+        let stored = serde_json::to_vec(&record).expect("the record serializes");
+        assert!(
+            stored.len() < 256 * 1024,
+            "the stored record grew to {} bytes",
+            stored.len()
+        );
+        assert_eq!(
+            finish_search(&mut record).expect("search completes").len(),
+            30
+        );
+    }
+
+    #[test]
+    fn reports_an_unparsable_search_line() {
+        let mut record = SearchRecord::new(0);
+        absorb(&mut record, "WARNING: something went wrong\n");
+        let detail = finish_search(&mut record).expect_err("the line is not a result");
+        assert!(detail.contains("WARNING: something went wrong"));
+    }
+
+    #[test]
+    fn drops_a_line_beyond_the_pending_cap() {
+        let mut record = SearchRecord::new(0);
+        absorb_search(&mut record, &vec![b'x'; MAX_PENDING_BYTES + 1]);
+        assert!(record.pending.is_empty());
+        assert!(record.discard_line);
+        let stored = serde_json::to_vec(&record).expect("the record serializes");
+        assert!(stored.len() < 256 * 1024);
+        assert!(finish_search(&mut record).is_err());
+    }
+
+    #[test]
+    fn reads_a_real_download_report() {
+        let mut record = DownloadRecord::new(0, "key".to_string(), 900);
+        absorb_download(&mut record, DOWNLOAD.as_bytes());
+        assert!(record.pending.is_empty());
+        assert_eq!(record.progress.bytes, 4_628_757);
+        assert_eq!(record.progress.total_bytes, Some(4_628_757));
+        assert_eq!(
+            record.printed.as_deref(),
+            Some("/tmp/dl-test/ZHGw78IJryE.opus")
+        );
+        assert_eq!(
+            progress::output_relative("key", record.printed.as_deref().unwrap_or_default())
+                .as_deref(),
+            Some("key/ZHGw78IJryE.opus")
+        );
+    }
+
+    #[test]
+    fn a_download_record_stays_small() {
+        let mut record = DownloadRecord::new(0, "key".to_string(), 900);
+        absorb_download(&mut record, &vec![b'y'; MAX_PENDING_BYTES * 2]);
+        absorb_download(&mut record, b"\ndownload:5/10\n");
+        let stored = serde_json::to_vec(&record).expect("the record serializes");
+        assert!(
+            stored.len() < 256 * 1024,
+            "the stored record grew to {} bytes",
+            stored.len()
+        );
+        assert_eq!(record.progress.bytes, 5);
+        assert_eq!(record.progress.total_bytes, Some(10));
+    }
+}

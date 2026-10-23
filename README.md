@@ -93,14 +93,19 @@ run at once.
 ## Notes
 
 - A search runs
-  `yt-dlp --ignore-config --no-warnings --no-playlist --skip-download --dump-json`
+  `yt-dlp --ignore-config --no-warnings --no-playlist --skip-download -f bestaudio/best -S abr --print <template>`
   with `<prefix><count>:<artist> <title>` as the search text, where `<artist>`
-  is the track's primary artist. Standard output is one JSON object per
-  result; the plugin keeps the results that carry both a page URL and an
-  audio-only format.
-- The chosen format is the audio-only format (`vcodec` equal to `none`) with
-  the highest average bitrate. Formats without a bitrate rank below every
-  format that has one.
+  is the track's primary artist. The template projects the fields a candidate
+  needs into one compact JSON object per result: `id`, `title`,
+  `webpage_url`, `extractor`, `channel_id`, `uploader_id`, `duration`, and the
+  selected format's `format_id`, `ext`, `vcodec`, `acodec`, `abr`, `asr`,
+  `filesize` and `filesize_approx`. A result line is a few hundred bytes
+  rather than a full metadata dump, so the plugin parses it as it arrives and
+  never stores the raw output.
+- yt-dlp selects the format: `-f bestaudio/best` asks for an audio-only
+  format, `-S abr` sorts by average bitrate, and the fallback keeps a result
+  usable when a site offers only muxed formats. The plugin skips a result
+  whose selected format is not audio-only or that has no page URL.
 - The file's `format` comes from the format's audio codec: `opus` stays
   `opus`, an `mp4a` codec becomes `aac`, and `vorbis` and `mp3` keep their
   names. A codec the server does not name leaves the field empty. The bitrate
@@ -115,22 +120,31 @@ run at once.
   server recycling a plugin instance; there is no server-side state a token
   points at.
 - A download runs
-  `yt-dlp --ignore-config --no-playlist -f <format id> -x --audio-format best --embed-metadata --newline --progress-template "download:%(progress.downloaded_bytes)s/%(progress.total_bytes)s" -o "<key>/%(id)s.%(ext)s" --print after_move:filepath <page URL>`.
+  `yt-dlp --ignore-config --no-playlist -f <format id> -x --audio-format best --embed-metadata --newline --no-quiet --progress-template "download:download:%(progress.downloaded_bytes)s/%(progress.total_bytes)s" -o "<key>/%(id)s.%(ext)s" --print after_move:filepath <page URL>`.
   `--audio-format best` keeps the chosen audio codec, so the file is not
-  re-encoded, and `--embed-metadata` writes the site's tags.
+  re-encoded, and `--embed-metadata` writes the site's tags. The template
+  repeats the `download:` prefix because yt-dlp consumes the first one as the
+  progress type, and `--no-quiet` restores progress, which `--print` would
+  otherwise suppress.
 - Progress comes from the `download:<downloaded>/<total>` lines; a `NA` total
   leaves the total unknown. A read can split a line, so the download keeps the
   unfinished line's bytes between polls.
+- A stored search holds the parsed candidates and the unfinished line, and a
+  stored download holds its progress, the printed path and bounded output
+  tails. Neither keeps raw process output: the host caps one stored value at
+  256 KiB, and an unfinished line beyond 64 KiB is dropped instead of kept.
 - When yt-dlp exits with status 0, the plugin takes the last path line it
   printed, keeps only its file name, and reports `<key>/<file name>` under the
   staging root after checking through `host-files` that the file is there. A
   non-zero exit reports the last standard error line, falling back to the last
   standard output line and then to the exit status.
 - `cancel-search` and `cancel-download` kill the process and forget the
-  token's record. A tool the manifest does not declare, a tool without a
-  configured path, and an option the host rejects are reported as
-  configuration errors; a process the operating system refuses to start is
-  reported as unavailable.
+  token's record. A tool without a configured path is reported as a
+  configuration error naming the setting; a spawn the host denies, a process
+  the operating system refuses to start, and a handle whose process is gone
+  are reported as unavailable with their detail. A search output line that is
+  not a result object fails the search with that line's text, so the server
+  log names what yt-dlp printed.
 - `health` validates the configuration and answers that yt-dlp is checked
   when an acquisition runs. It starts no process: the host allows a tool only
   during an acquisition, where a staging directory exists, so a probe outside
@@ -145,10 +159,11 @@ run at once.
 | `src/args.rs` | The yt-dlp argument vectors and the search text. |
 | `src/config.rs` | The instance configuration and its schema-level checks. |
 | `src/progress.rs` | Progress lines, printed paths and exit handling. |
-| `src/search.rs` | `--dump-json` parsing: format choice, codec names and source keys. |
-| `src/token.rs` | The candidate token and the stored byte encoding. |
+| `src/search.rs` | Search result parsing: the selected format, codec names and source keys. |
+| `src/token.rs` | The candidate token. |
 | `manifest.json` | The plugin manifest the server reads. |
 | `src/fixtures/search.json` | A captured search output the parsing tests run on. |
+| `src/fixtures/download.txt` | A captured download report the progress tests run on. |
 
 ## License
 

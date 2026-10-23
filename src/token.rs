@@ -3,9 +3,7 @@
 //! A candidate token has to survive the server recycling a plugin instance, so
 //! it carries the values rather than naming a row in the key-value store. It is
 //! URL-safe base64 over a small JSON object, because the host treats a token as
-//! an opaque string and the plugin prints it in logs. The same encoding keeps a
-//! process's accumulated output inside a stored search or download record
-//! without the size blow-up of a byte array in JSON.
+//! an opaque string and the plugin prints it in logs.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -67,34 +65,6 @@ impl DownloadToken {
     }
 }
 
-/// Encodes bytes as URL-safe base64 without padding.
-///
-/// # Parameters
-///
-/// - `bytes`: the bytes to store.
-///
-/// # Returns
-///
-/// The encoded text, readable by [`decode_bytes`].
-pub fn encode_bytes(bytes: &[u8]) -> String {
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-
-/// Decodes text written by [`encode_bytes`].
-///
-/// # Parameters
-///
-/// - `text`: the stored text.
-///
-/// # Returns
-///
-/// The bytes it carries, or an empty vector when the text is not URL-safe
-/// base64, so an unreadable buffer is treated as no output rather than failing
-/// a poll.
-pub fn decode_bytes(text: &str) -> Vec<u8> {
-    URL_SAFE_NO_PAD.decode(text).unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,13 +91,6 @@ mod tests {
         assert!(!encoded.contains('+'));
         assert!(!encoded.contains('/'));
         assert!(!encoded.contains('='));
-    }
-
-    #[test]
-    fn round_trips_stored_bytes() {
-        let bytes = b"download:1/2\npath/to/out.opus\n";
-        assert_eq!(decode_bytes(&encode_bytes(bytes)), bytes);
-        assert!(decode_bytes("not base64!").is_empty());
     }
 
     #[test]
