@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Health reporting: `health` no longer starts yt-dlp outside an acquisition,
+  where the host denies the spawn and the setup summary showed the instance as
+  an invalid configuration. It validates the configuration and says that
+  yt-dlp is checked when an acquisition runs.
+
 ## [0.1.0] - 2026-10-23
 
 ### Added

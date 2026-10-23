@@ -23,8 +23,6 @@ mod progress;
 mod search;
 mod token;
 
-use std::time::{Duration, Instant};
-
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -53,12 +51,6 @@ const SEARCH_TTL_MS: u64 = 10 * 60 * 1000;
 
 /// How long a stored download may stay readable before it is dropped.
 const DOWNLOAD_TTL_MS: u64 = 2 * 60 * 60 * 1000;
-
-/// How long the health probe waits for `yt-dlp --version`.
-const HEALTH_DEADLINE: Duration = Duration::from_secs(8);
-
-/// How often the health probe asks whether the version process finished.
-const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The plugin implementation.
 struct YtDlpAcquisition;
@@ -443,50 +435,26 @@ impl lifecycle::Guest for YtDlpAcquisition {
         }
     }
 
+    /// Reports readiness without starting the tool.
+    ///
+    /// The host allows `host-process.spawn` only while an acquisition has a
+    /// staging directory, so a health probe that started `yt-dlp` would always
+    /// be denied and the instance would look misconfigured. The probe
+    /// validates the configuration and tells the administrator where the
+    /// executable is checked instead.
+    ///
+    /// # Returns
+    ///
+    /// A status line saying the instance is ready and that `yt-dlp` is checked
+    /// when an acquisition runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::InvalidConfig`] when the server configuration
+    /// does not load or is out of range.
     fn health() -> Result<String, ProviderError> {
-        let handle = spawn(args::version_arguments(), args::VERSION_TIMEOUT_MS)?;
-        let deadline = Instant::now() + HEALTH_DEADLINE;
-        loop {
-            match process::poll(handle).map_err(process_error)? {
-                ProcessState::Running => {
-                    if Instant::now() >= deadline {
-                        process::kill(handle);
-                        return Err(ProviderError::Unavailable(
-                            "yt-dlp did not report its version in time".to_string(),
-                        ));
-                    }
-                    std::thread::sleep(HEALTH_POLL_INTERVAL);
-                }
-                ProcessState::Exited(0) => {
-                    let output = read_stdout(handle)?;
-                    process::kill(handle);
-                    let version = String::from_utf8_lossy(&output)
-                        .lines()
-                        .next()
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
-                    return Ok(if version.is_empty() {
-                        TOOL.to_string()
-                    } else {
-                        version
-                    });
-                }
-                ProcessState::Exited(code) => {
-                    let stderr = String::from_utf8_lossy(&read_stderr(handle)).to_string();
-                    process::kill(handle);
-                    return Err(ProviderError::Unavailable(progress::failure_detail(
-                        code, &stderr, "",
-                    )));
-                }
-                ProcessState::Killed | ProcessState::TimedOut => {
-                    process::kill(handle);
-                    return Err(ProviderError::Unavailable(
-                        "yt-dlp --version did not finish".to_string(),
-                    ));
-                }
-            }
-        }
+        Config::load()?;
+        Ok("configuration is valid; yt-dlp is checked when an acquisition runs".to_string())
     }
 }
 

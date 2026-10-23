@@ -131,8 +131,10 @@ run at once.
   configured path, and an option the host rejects are reported as
   configuration errors; a process the operating system refuses to start is
   reported as unavailable.
-- `health` runs `yt-dlp --version` and answers with the version line, so an
-  administrator sees at a glance whether the configured executable works.
+- `health` validates the configuration and answers that yt-dlp is checked
+  when an acquisition runs. It starts no process: the host allows a tool only
+  during an acquisition, where a staging directory exists, so a probe outside
+  one would always be denied.
 
 ## Layout
 

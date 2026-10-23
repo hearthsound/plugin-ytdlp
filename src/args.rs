@@ -14,9 +14,6 @@ use crate::token::DownloadToken;
 /// can be slow, so the limit is generous.
 pub const SEARCH_TIMEOUT_MS: u32 = 120_000;
 
-/// How long the `--version` probe may run, in milliseconds.
-pub const VERSION_TIMEOUT_MS: u32 = 10_000;
-
 /// Builds the search text, prefix included.
 ///
 /// # Parameters
@@ -114,15 +111,6 @@ pub fn download_arguments(key: &str, token: &DownloadToken) -> Vec<String> {
     .to_vec()
 }
 
-/// Builds the arguments of the version probe.
-///
-/// # Returns
-///
-/// `["--version"]`.
-pub fn version_arguments() -> Vec<String> {
-    vec!["--version".to_string()]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,10 +185,5 @@ mod tests {
                 "https://www.youtube.com/watch?v=abc123",
             ]
         );
-    }
-
-    #[test]
-    fn probes_the_version() {
-        assert_eq!(version_arguments(), ["--version"]);
     }
 }
