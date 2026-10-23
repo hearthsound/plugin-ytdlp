@@ -1,0 +1,60 @@
+{
+  "manifestVersion": 1,
+  "id": "app.hearthsound.ytdlp",
+  "name": "yt-dlp acquisition",
+  "version": "0.1.0",
+  "description": "Acquire tracks with yt-dlp from the sites it supports.",
+  "authors": ["Hearthsound contributors"],
+  "license": "MIT OR Apache-2.0",
+  "homepage": "https://github.com/hearthsound/plugin-ytdlp",
+  "api": "hearthsound:plugin@0.3.0",
+  "provides": ["acquisition"],
+  "permissions": {
+    "kv": { "maxBytes": 2097152 },
+    "files": { "importRoots": false },
+    "process": { "tools": ["yt-dlp"] }
+  },
+  "config": {
+    "server": {
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "searchCount": {
+            "type": "integer",
+            "title": "Search results",
+            "description": "How many search results one query asks yt-dlp for.",
+            "default": 5,
+            "minimum": 1,
+            "maximum": 10
+          },
+          "searchPrefix": {
+            "type": "string",
+            "title": "Search site",
+            "description": "The yt-dlp search prefix: ytsearch for YouTube, scsearch for SoundCloud.",
+            "enum": ["ytsearch", "scsearch"],
+            "default": "ytsearch"
+          },
+          "downloadTimeoutSecs": {
+            "type": "integer",
+            "title": "Download timeout (s)",
+            "description": "How long one download may run before the host kills yt-dlp.",
+            "default": 900,
+            "minimum": 60,
+            "maximum": 3600
+          }
+        }
+      },
+      "uiSchema": {
+        "type": "VerticalLayout",
+        "elements": [
+          { "type": "Control", "scope": "#/properties/searchCount" },
+          { "type": "Control", "scope": "#/properties/searchPrefix" },
+          { "type": "Control", "scope": "#/properties/downloadTimeoutSecs" }
+        ]
+      }
+    },
+    "user": null
+  },
+  "resources": { "memoryMb": 64, "callTimeoutMs": 30000, "maxInstances": 2 }
+}
