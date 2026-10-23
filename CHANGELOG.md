@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-23
+
 ### Added
 
 - The repository scaffolding: the crate manifest, the toolchain pin, the dual
@@ -26,4 +28,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A CI workflow that formats, lints, tests, builds, checks and packs the
   plugin, and uploads the archive.
 
-[Unreleased]: https://github.com/hearthsound/plugin-ytdlp/commits/main
+[Unreleased]: https://github.com/hearthsound/plugin-ytdlp/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/hearthsound/plugin-ytdlp/releases/tag/v0.1.0
