@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-25
+
+### Changed
+
+- Build against the `hearthsound:plugin@0.4.0` API (plugin-sdk v0.4.0).
+
 ## [0.1.2] - 2026-10-23
 
 ### Fixed
@@ -58,7 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A CI workflow that formats, lints, tests, builds, checks and packs the
   plugin, and uploads the archive.
 
-[Unreleased]: https://github.com/hearthsound/plugin-ytdlp/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/hearthsound/plugin-ytdlp/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/hearthsound/plugin-ytdlp/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/hearthsound/plugin-ytdlp/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/hearthsound/plugin-ytdlp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/hearthsound/plugin-ytdlp/releases/tag/v0.1.0
